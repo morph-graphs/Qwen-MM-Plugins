@@ -545,6 +545,40 @@ def _transcribe_chunk_dashscope(audio_path: str, model: str, api_key: str) -> li
     return sentences
 
 
+def _transcribe_chunk_openai(audio_path: str, model: str, api_key: str, max_retries: int = 8) -> list[str]:
+    """Transcribe a WAV chunk via <DASHSCOPE_BASE_URL>/audio/transcriptions (OpenAI-compatible JSON body
+    with base64 audio, as OpenRouter takes it). Used when QWEN_MM_ASR_API=openai."""
+    import random
+
+    import requests
+
+    from embeddings import check_spend, record_usage
+
+    url = get_env("DASHSCOPE_BASE_URL").rstrip("/") + "/audio/transcriptions"
+    with open(audio_path, "rb") as f:
+        body = {"model": model, "input_audio": {"data": base64.b64encode(f.read()).decode(), "format": "wav"}}
+    for attempt in range(max_retries + 1):
+        check_spend()
+        try:
+            resp = requests.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=body, timeout=300)
+            # 404/405: no such endpoint or model here; better to stop than build a memory without speech
+            if resp.status_code in (400, 401, 402, 403, 404, 405):
+                raise ConfigurationError(f"ASR request rejected (HTTP {resp.status_code}): {resp.text[:200]}")
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except ConfigurationError:
+            raise
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            time.sleep(min(2**attempt + random.random(), 60.0))
+            print(f"  ASR retry {attempt + 1}/{max_retries}: {str(e)[:160]}")
+    record_usage("asr", model, data.get("usage"))
+    text = (data.get("text") or "").strip()
+    return [text] if text else []
+
+
 def run_asr_parallel(
     video_path: str,
     output_dir: str,
@@ -577,10 +611,15 @@ def run_asr_parallel(
         wav_path = os.path.join(tmp_dir, f"chunk_{i:04d}.wav")
         try:
             _extract_audio_chunk(video_path, wav_path, start, end - start)
-            sentences = _transcribe_chunk_dashscope(wav_path, model, api_key)
+            if (get_env("QWEN_MM_ASR_API") or "dashscope") == "openai":
+                sentences = _transcribe_chunk_openai(wav_path, model, api_key)
+            else:
+                sentences = _transcribe_chunk_dashscope(wav_path, model, api_key)
             text = " ".join(sentences)
             if text.strip():
                 return {"start_sec": start, "end_sec": end, "text": text}
+        except ConfigurationError:
+            raise
         except Exception as e:
             print(f"  ASR chunk {i} ({sec_to_time_str(start)}-{sec_to_time_str(end)}): {e}")
         finally:
@@ -1403,6 +1442,8 @@ def build_graph_memory(
             transcript = asr_future.result()
             merge_asr_into_macros(macros, transcript)
             print(f"  ASR: Merged {sum(1 for m in macros if m.asr_text)}/{len(macros)} macros with transcript")
+        except ConfigurationError:
+            raise
         except Exception as e:
             print(f"  ASR failed (non-fatal): {e}")
         finally:
@@ -1615,6 +1656,8 @@ if __name__ == "__main__":
                 transcript = asr_future.result()
                 merge_asr_into_macros(macros, transcript)
                 print(f"  ASR: Merged {sum(1 for m in macros if m.asr_text)}/{len(macros)} macros with transcript")
+            except ConfigurationError:
+                raise
             except Exception as e:
                 print(f"  ASR failed (non-fatal): {e}")
             finally:

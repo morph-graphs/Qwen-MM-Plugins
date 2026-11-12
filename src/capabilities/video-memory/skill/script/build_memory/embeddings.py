@@ -17,9 +17,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 try:  # server package imports shared; the flat build pipeline falls back to its env_config mirror
-    from shared.env import get_env
+    from shared.env import ConfigurationError, get_env
 except ImportError:
-    from env_config import get_env
+    from env_config import ConfigurationError, get_env
 
 if TYPE_CHECKING:
     import zvec
@@ -91,6 +91,98 @@ def _embed_via_dashscope_native(texts: list[str], batch_size: int = 256, max_ret
         embs = [e["embedding"] for e in data["output"]["embeddings"]]
         all_embs.extend(embs)
     return np.array(all_embs, dtype=np.float32)
+
+
+# ── OpenAI-compatible endpoints (e.g. OpenRouter): usage log, spend cap, embeddings ──────────────
+# QWEN_MM_USAGE_LOG: JSONL file; every billed call appends {kind, model, tokens, cost} (cost in USD as
+# the endpoint reports it, e.g. OpenRouter's usage.cost). QWEN_MM_SPEND_CAP_USD: refuse any new call
+# once the log's total cost reaches it. Both are read at call time; unset means no log / no cap.
+
+
+class SpendCapExceeded(ConfigurationError):
+    """Raised before a call once QWEN_MM_SPEND_CAP_USD is reached (a ConfigurationError, so the build
+    stages re-raise it instead of retrying or skipping the item)."""
+
+
+def spent_usd() -> float:
+    path = os.environ.get("QWEN_MM_USAGE_LOG")
+    if not path or not os.path.exists(path):
+        return 0.0
+    total = 0.0
+    with open(path) as f:
+        for line in f:
+            try:
+                total += float(json.loads(line).get("cost") or 0)
+            except (ValueError, AttributeError):
+                pass
+    return total
+
+
+def check_spend() -> None:
+    cap = os.environ.get("QWEN_MM_SPEND_CAP_USD")
+    if cap and spent_usd() >= float(cap):
+        raise SpendCapExceeded(f"spend cap reached: ${spent_usd():.4f} >= QWEN_MM_SPEND_CAP_USD=${float(cap):.2f}")
+
+
+def record_usage(kind: str, model: str, usage: dict | None, **extra) -> None:
+    path = os.environ.get("QWEN_MM_USAGE_LOG")
+    if not path:
+        return
+    u = usage or {}
+    row = {
+        "t": round(time.time(), 3),
+        "kind": kind,
+        "model": model,
+        "prompt_tokens": u.get("prompt_tokens", 0),
+        "completion_tokens": u.get("completion_tokens", 0),
+        "reasoning_tokens": (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0),
+        "cost": u.get("cost", 0) or 0,
+        **extra,
+    }
+    with open(path, "a") as f:  # one short line per write: O_APPEND keeps parallel writers' lines whole
+        f.write(json.dumps(row) + "\n")
+
+
+def _embed_via_openai_compatible(texts: list[str], batch_size: int = 64, max_retries: int = _MAX_RETRIES) -> np.ndarray:
+    """Embed texts via <DASHSCOPE_BASE_URL>/embeddings with QWEN_MM_EMBED_MODEL (OpenAI-compatible)."""
+    import requests as _requests
+
+    model = get_env("QWEN_MM_EMBED_MODEL")
+    url = (get_env("DASHSCOPE_BASE_URL") or "").rstrip("/") + "/embeddings"
+    headers = {"Authorization": f"Bearer {get_env('DASHSCOPE_API_KEY', '')}", "Content-Type": "application/json"}
+    all_embs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        for attempt in range(max_retries + 1):
+            check_spend()
+            try:
+                resp = _requests.post(url, headers=headers, json={"model": model, "input": batch}, timeout=120)
+                if resp.status_code in (400, 401, 402, 403, 404, 405):
+                    raise ConfigurationError(f"embedding request rejected (HTTP {resp.status_code}): {resp.text[:200]}")
+                resp.raise_for_status()
+                data = resp.json()
+                embs = [e["embedding"] for e in sorted(data["data"], key=lambda e: e["index"])]
+                if len(embs) != len(batch):
+                    raise RuntimeError(f"got {len(embs)} embeddings for {len(batch)} texts")
+                break
+            except ConfigurationError:
+                raise
+            except Exception as e:
+                if attempt == max_retries:
+                    raise
+                delay = min(_RETRY_BASE_DELAY * (2 ** min(attempt, 6)) + random.random(), 60.0)
+                print(f"  [embed] {str(e)[:160]}; retry {attempt + 1}/{max_retries} in {delay:.1f}s", file=sys.stderr)
+                time.sleep(delay)
+        record_usage("embed", model, data.get("usage"), n=len(batch))
+        all_embs.extend(embs)
+    return np.array(all_embs, dtype=np.float32)
+
+
+def _embed_texts(texts: list[str], max_retries: int = _MAX_RETRIES) -> np.ndarray:
+    """QWEN_MM_EMBED_MODEL set: the OpenAI-compatible /embeddings endpoint; else DashScope native."""
+    if get_env("QWEN_MM_EMBED_MODEL"):
+        return _embed_via_openai_compatible(texts, max_retries=max_retries)
+    return _embed_via_dashscope_native(texts, max_retries=max_retries)
 
 
 # Hint shown when the query-time embedding backend is missing/mismatched.
@@ -209,12 +301,12 @@ def embed_nodes(nodes: list[dict], batch_size: int = 256, max_workers: int = 4) 
 
     if n_workers <= 1:
         for slot, texts in enumerate(batches):
-            results[slot] = _embed_via_dashscope_native(texts)
+            results[slot] = _embed_texts(texts)
             done_count += len(texts)
             print(f"  Embedded {done_count}/{len(nodes)} nodes", file=sys.stderr)
     else:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(_embed_via_dashscope_native, texts): slot for slot, texts in enumerate(batches)}
+            futures = {pool.submit(_embed_texts, texts): slot for slot, texts in enumerate(batches)}
             for future in as_completed(futures):
                 slot = futures[future]
                 results[slot] = future.result()
@@ -249,7 +341,7 @@ class EmbeddingIndex:
         """NPZ loading leaves no open file handles."""
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
-        return _embed_via_dashscope_native(texts)
+        return _embed_texts(texts)
 
     def _set_embeddings(self, embeddings: np.ndarray | None):
         self.embeddings = embeddings
@@ -312,7 +404,7 @@ class EmbeddingIndex:
         try:
             # Cap retries here so a rate-limited endpoint doesn't stall every toolkit load for
             # minutes before BM25 fallback; the full retry budget still applies to real queries.
-            q_emb = _embed_via_dashscope_native(["dimension check"], max_retries=3)
+            q_emb = _embed_texts(["dimension check"], max_retries=3)
             query_dim = q_emb.shape[1]
         except Exception as e:
             raise RuntimeError(
@@ -560,7 +652,7 @@ class ZvecEmbeddingIndex:
         return self._dimension
 
     def _embed_batch(self, texts: list[str]) -> np.ndarray:
-        return _embed_via_dashscope_native(texts)
+        return _embed_texts(texts)
 
     def load(self, path: str) -> None:
         zvec = _require_zvec()
@@ -595,7 +687,7 @@ class ZvecEmbeddingIndex:
         if self._collection is None or self._doc_count == 0:
             return
         try:
-            q_emb = _embed_via_dashscope_native(["dimension check"], max_retries=3)
+            q_emb = _embed_texts(["dimension check"], max_retries=3)
             query_dim = q_emb.shape[1]
         except Exception as e:
             raise RuntimeError(

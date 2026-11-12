@@ -84,7 +84,10 @@ fi
 _MISSING_PKGS=()
 python -c "import cv2" 2>/dev/null || _MISSING_PKGS+=(opencv-python-headless)
 python -c "import numpy" 2>/dev/null || _MISSING_PKGS+=('numpy<2')
-python -c "import dashscope" 2>/dev/null || _MISSING_PKGS+=(dashscope)
+# The dashscope SDK is only needed for DashScope's native ASR (QWEN_MM_ASR_API=openai uses plain HTTP)
+if [[ "${QWEN_MM_ASR_API:-dashscope}" != "openai" ]]; then
+    python -c "import dashscope" 2>/dev/null || _MISSING_PKGS+=(dashscope)
+fi
 _ZVEC_CHECK='import sys, zvec; version = tuple(map(int, zvec.__version__.split(".")[:2])); sys.exit(0 if (0, 8) <= version < (1, 0) else 1)'
 if [[ "$RETRIEVAL_BACKEND" == "zvec" ]]; then
     python -c "$_ZVEC_CHECK" 2>/dev/null || _MISSING_PKGS+=('zvec>=0.8,<1')
@@ -92,6 +95,11 @@ fi
 _PYDANTIC_CHECK='import pydantic; assert (2, 11) <= tuple(map(int, pydantic.__version__.split(".")[:2])) < (3, 0)'
 python -c "$_PYDANTIC_CHECK" 2>/dev/null || _MISSING_PKGS+=('pydantic>=2.11,<3')
 
+if [[ ${#_MISSING_PKGS[@]} -gt 0 && "${QWEN_MM_NO_PIP:-0}" == "1" ]]; then
+    # a pinned environment (QWEN_MM_NO_PIP=1) is never changed behind its owner's back
+    echo "ERROR: missing Python packages: ${_MISSING_PKGS[*]} (QWEN_MM_NO_PIP=1: not installing)"
+    exit 1
+fi
 if [[ ${#_MISSING_PKGS[@]} -gt 0 ]]; then
     echo "Installing missing packages: ${_MISSING_PKGS[*]}"
     python -m pip install -q -i https://mirrors.aliyun.com/pypi/simple/ --timeout 60 "${_MISSING_PKGS[@]}" || {
@@ -104,7 +112,7 @@ if [[ "$RETRIEVAL_BACKEND" == "zvec" ]] && ! python -c "$_ZVEC_CHECK" 2>/dev/nul
     exit 1
 fi
 
-if [[ $ENABLE_ASR -eq 1 ]]; then
+if [[ $ENABLE_ASR -eq 1 && "${QWEN_MM_ASR_API:-dashscope}" != "openai" ]]; then
     if ! python -c "import dashscope" 2>/dev/null; then
         echo "ERROR: ASR is enabled but 'dashscope' package is not installed and install failed."
         echo "  Either install it manually (pip install dashscope) or disable ASR with --no-asr"

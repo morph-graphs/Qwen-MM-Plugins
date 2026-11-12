@@ -9,7 +9,8 @@ import time
 from typing import Any
 
 import requests
-from env_config import get_env, get_int_env
+from embeddings import check_spend, record_usage
+from env_config import ConfigurationError, get_env, get_int_env
 
 MAX_RETRIES = 60
 RETRYABLE_STATUS_CODES = {418, 429, 500, 502, 503}
@@ -46,7 +47,7 @@ def call_vlm_curl(
     frame_items: list[tuple[str, str]] | None = None,
     model: str | None = None,
     api_key: str = "",
-    temperature: float = 0.7,
+    temperature: float | None = None,
     max_output_tokens: int = 65536,
     max_retries: int = MAX_RETRIES,
 ) -> str:
@@ -68,12 +69,16 @@ def call_vlm_curl(
         msg_content = content[0]["text"]
     else:
         msg_content = content
+    if temperature is None:  # upstream default 0.7; QWEN_MM_BUILD_TEMPERATURE overrides it for every build call
+        temperature = float(get_env("QWEN_MM_BUILD_TEMPERATURE") or 0.7)
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": msg_content}],
         "temperature": temperature,
         "max_tokens": max_output_tokens,
     }
+    if get_env("QWEN_MM_SEED"):
+        payload["seed"] = int(get_env("QWEN_MM_SEED"))
 
     if not api_key:
         api_key = get_env("DASHSCOPE_API_KEY") or ""
@@ -85,6 +90,7 @@ def call_vlm_curl(
 
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
+        check_spend()  # outside the retry handling: a reached cap stops the build
         try:
             resp = requests.post(
                 api_url,
@@ -100,6 +106,8 @@ def call_vlm_curl(
                 error_code = data["error"].get("code", "")
                 if resp.status_code == 400:
                     raise RuntimeError(f"400 Bad Request: {error_msg}")
+                if resp.status_code in (401, 402, 403):  # key or credit problem: retrying cannot help
+                    raise ConfigurationError(f"API rejected the request (HTTP {resp.status_code}): {error_msg}")
                 if resp.status_code in RETRYABLE_STATUS_CODES:
                     raise RuntimeError(f"Retryable HTTP {resp.status_code}: {error_msg}")
                 raise RuntimeError(f"API error {error_code} (HTTP {resp.status_code}): {error_msg}")
@@ -108,9 +116,15 @@ def call_vlm_curl(
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
             if "choices" in data:
-                return data["choices"][0]["message"]["content"]
+                record_usage("chat", model, data.get("usage"), n_images=len(frame_items or []))
+                content = data["choices"][0]["message"].get("content")
+                if not content:  # e.g. a reasoning model that spent max_tokens thinking
+                    raise RuntimeError(f"empty content (finish_reason={data['choices'][0].get('finish_reason')})")
+                return content
 
             raise RuntimeError(f"No choices: {json.dumps(data)[:500]}")
+        except ConfigurationError:
+            raise
         except Exception as exc:
             last_exc = exc
             err_msg = str(exc)
